@@ -9,6 +9,8 @@
 // --- Hardware Mapping ---
 #define RELAY_PUMP1 21 // Blue Liquid
 #define RELAY_PUMP2 19 // Yellow Liquid
+// WARNING: Flow rate pressure cannot be reduced via software on a Relay.
+// Requires a physical valve restrictor or changing to a MOSFET with PWM.
 #define RELAY_PUMP3 18 // Final Green Liquid (Dispense)
 
 #define STEPPER_MIXER_STEP 25
@@ -32,16 +34,18 @@
 #define WDT_TIMEOUT 10
 
 // --- Parameters ---
-const float TARGET_EMPTY_CM = 22.0;  // Used for UI progress bar math
-const float TARGET_FULL_CM = 11.0;   // Stop filling point
-const float REFILL_THRESHOLD_CM = 17.0; // [Zatona] Hysteresis: Only start filling if level drops below 17cm
+const float TARGET_EMPTY_CM = 22.0; // Used for UI progress bar math
+const float TARGET_FULL_CM = 11.0;  // Stop filling point
+const float REFILL_THRESHOLD_CM =
+    17.0; // [Zatona] Hysteresis: Only start filling if level drops below 17cm
 
 const unsigned long MIX_DURATION = 30000;
 const unsigned long DISPENSE_TIMER = 5000;       // [Zatona] 5 seconds dispense
-const unsigned long CONVEYOR_CENTER_DELAY = 200; // Delay to center cup
+const unsigned long CONVEYOR_CENTER_DELAY = 450; // Delay to center cup
 const unsigned long FILL_SAFETY_TIMER = 125000;  // 125 seconds
-const unsigned long CLEAR_CUP_TIMER = 1500;      // [Zatona] Blind time: 1.5s to ensure cup clears IR sensor
-const unsigned long US_PING_INTERVAL = 600;      // [Zatona] 5 pings * 600ms = 3000ms
+const unsigned long CLEAR_CUP_TIMER =
+    3000; // [Zatona] Blind time: 1.5s to ensure cup clears IR sensor
+const unsigned long US_PING_INTERVAL = 600; // [Zatona] 5 pings * 600ms = 3000ms
 
 // --- Network & WebSockets ---
 WebServer server(80);
@@ -340,7 +344,8 @@ float readUltrasonic();
 void setState(SystemState newState);
 void resumeState(SystemState stateToResume);
 void handleRoot();
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
+                    size_t length);
 void core0TaskCode(void *pvParameters);
 
 void handleRoot() { server.send_P(200, "text/html", index_html); }
@@ -349,6 +354,15 @@ void core0TaskCode(void *pvParameters) {
   for (;;) {
     server.handleClient();
     webSocket.loop();
+
+    // [Zatona] Architectural fix: Moved ultrasonic ping to Core 0 so pulseIn
+    // does not block Core 1 [Zatona] US_PING_INTERVAL is now 600ms. 5 pings =
+    // exactly 3 seconds for strict debounce.
+    if (millis() - lastUsPingTime > US_PING_INTERVAL) {
+      currentDistance = readUltrasonic();
+      lastUsPingTime = millis();
+      newPing = true;
+    }
 
     if (millis() - lastBroadcastTime > 200) {
       char jsonBuffer[128];
@@ -416,12 +430,13 @@ void setup() {
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_RED, OUTPUT);
 
-  // [Ninja] Modified Dynamics: Mixer speed lowered for stability, Conveyor setup for max torque & snapping
-  mixerStepper.setMaxSpeed(4000.0);
-  mixerStepper.setAcceleration(3000.0);
+  // [Ninja] Modified Dynamics: Mixer speed lowered for stability, Conveyor
+  // setup for max torque & snapping
+  mixerStepper.setMaxSpeed(2500.0);
+  mixerStepper.setAcceleration(4000.0);
 
-  conveyorStepper.setMaxSpeed(1000.0);
-  conveyorStepper.setAcceleration(4000.0);
+  conveyorStepper.setMaxSpeed(1500.0);
+  conveyorStepper.setAcceleration(3000.0);
   conveyorStepper.setPinsInverted(true, false, false);
 
   // ==========================================
@@ -447,7 +462,8 @@ void setup() {
 
 #if defined(CONFIG_IDF_TARGET_ESP32)
   esp_task_wdt_config_t wdt_config = {.timeout_ms = WDT_TIMEOUT * 1000,
-                                      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+                                      .idle_core_mask =
+                                          (1 << portNUM_PROCESSORS) - 1,
                                       .trigger_panic = true};
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
@@ -455,7 +471,8 @@ void setup() {
 
   // [Zatona] Mastermind Fix: Protected NVS flash lifespan
   preferences.begin("machine_data", false);
-  // preferences.putInt("cups", 0); // UNCOMMENT ONLY ONCE TO RESET, THEN RE-COMMENT TO PROTECT FLASH MEMORY
+  // preferences.putInt("cups", 0); // UNCOMMENT ONLY ONCE TO RESET, THEN
+  // RE-COMMENT TO PROTECT FLASH MEMORY
   cupCounter = preferences.getInt("cups", 0);
 
   xTaskCreatePinnedToCore(core0TaskCode, "Core0Task", 10000, NULL, 1,
@@ -494,27 +511,31 @@ void loop() {
   if (cmdContinue) {
     cmdContinue = false;
     if (currentState == STATE_PAUSED) {
+      // 1. Calculate EXACTLY how long we were paused
+      unsigned long pauseDuration = millis() - stateStartTime;
+
+      // 2. Safely resume the steppers and state pointer
       resumeState(previousState);
-      stateStartTime = millis() - timeSpentInState; // Restore exact timer safely
+
+      // 3. Restore the State's operational timer
+      stateStartTime = millis() - timeSpentInState;
+
+      // 4. Shift all active sub-timers forward by the pause duration
+      indexTimer += pauseDuration;
+      mixerRampDownStartTime += pauseDuration;
     }
   }
 
   mixerStepper.run();
   conveyorStepper.run();
 
-  // [Zatona] US_PING_INTERVAL is now 600ms. 5 pings = exactly 3 seconds for strict debounce.
-  if (millis() - lastUsPingTime > US_PING_INTERVAL) {
-    currentDistance = readUltrasonic();
-    lastUsPingTime = millis();
-    newPing = true;
-  }
-
   switch (currentState) {
   case STATE_IDLE:
     break;
 
   case STATE_CHECK_LEVEL:
-    // [Zatona] Mastermind Fix: If distance is >= 17cm OR it's 999.0 (timeout/boot), FORCE filling to prevent dry runs.
+    // [Zatona] Mastermind Fix: If distance is >= 17cm OR it's 999.0
+    // (timeout/boot), FORCE filling to prevent dry runs.
     if (currentDistance >= REFILL_THRESHOLD_CM || currentDistance == 999.0) {
       setState(STATE_FILLING);
     } else {
@@ -537,7 +558,8 @@ void loop() {
           setState(STATE_MIXING);
         }
       } else if (currentDistance > TARGET_FULL_CM && currentDistance != 999.0) {
-        // Only reset debounce if we explicitly read a valid distance ABOVE the target
+        // Only reset debounce if we explicitly read a valid distance ABOVE the
+        // target
         ultrasonicDebounceCount = 0;
       }
     }
@@ -570,9 +592,11 @@ void loop() {
     break;
 
   case STATE_CONVEYING:
-    // [Zatona] Mastermind Fix: Ensure the motor gets movement commands in BOTH seeking phases
-    // This prevents Deadlock if PAUSE clears the target distance during indexPhase 1
-    if (indexPhase == 0 || indexPhase == 1) {
+    // [Zatona] Mastermind Fix: Ensure the motor gets movement commands in BOTH
+    // seeking phases This prevents Deadlock if PAUSE clears the target distance
+    // during indexPhase 1 [Zatona] Architectural fix: Added indexPhase == 2 to
+    // prevent stalling after pause
+    if (indexPhase == 0 || indexPhase == 1 || indexPhase == 2) {
       if (conveyorStepper.distanceToGo() == 0) {
         conveyorStepper.move(1000000);
       }
@@ -610,7 +634,8 @@ void loop() {
     break;
 
   case STATE_CLEAR_CUP:
-    // [Zatona] This phase acts as the blind time. The IR sensor is completely ignored here.
+    // [Zatona] This phase acts as the blind time. The IR sensor is completely
+    // ignored here.
     if (!conveyorRampingDown) {
       if (conveyorStepper.distanceToGo() == 0) {
         conveyorStepper.move(1000000);
@@ -646,7 +671,8 @@ void loop() {
 }
 
 void setState(SystemState newState) {
-  // Only enable steppers when physical movement is required to prevent thermal overload
+  // Only enable steppers when physical movement is required to prevent thermal
+  // overload
   if (newState == STATE_MIXING || newState == STATE_CONVEYING ||
       newState == STATE_CLEAR_CUP) {
     digitalWrite(STEPPER_ENABLE_PIN, DRIVER_ENABLED);
